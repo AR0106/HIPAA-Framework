@@ -127,3 +127,7 @@ func PurgeData(filePath string) error {
 
 	return os.Remove(filePath)
 }
+
+func CloseDataService(file *os.File) error {
+	return file.Close()
+}
