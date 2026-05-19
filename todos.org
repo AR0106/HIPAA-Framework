@@ -13,7 +13,7 @@ Evidence: `sql.Open("sqleet", "cdd.db?_key=...")` in `HIPAA Framework/user/user_
 ** [-] Encrypted CSV storage for PHI (per-record AEAD)
 Evidence: AES-GCM used in `HIPAA Framework/crypto/crypto_service.go`; called from `HIPAA Framework/data/data_service.go`
 
-*** TODO Enforce strong, correctly-sized encryption keys for AES-GCM
+*** DONE Enforce strong, correctly-sized encryption keys for AES-GCM
 - Current gap: `EncryptData` accepts arbitrary byte slice; upstream may pass weak/short strings.
 - Goal: require 16/24/32-byte key (AES-128/192/256), reject others with explicit error.
 

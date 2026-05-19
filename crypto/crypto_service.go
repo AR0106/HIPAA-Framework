@@ -22,6 +22,7 @@ import (
 // TODO: Implement proper key and user management and secure storage for the encryption key
 
 func EncryptData(data []byte, key []byte) (string, error) {
+	key = normalizeAESKey(key)
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return "", err
@@ -42,6 +43,7 @@ func EncryptData(data []byte, key []byte) (string, error) {
 }
 
 func DecryptData(encodedData string, key []byte) ([]byte, error) {
+	key = normalizeAESKey(key)
 	ciphertext, err := base64.StdEncoding.DecodeString(encodedData)
 	if err != nil {
 		return nil, err
@@ -64,6 +66,18 @@ func DecryptData(encodedData string, key []byte) ([]byte, error) {
 
 	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
 	return gcm.Open(nil, nonce, ciphertext, nil)
+}
+
+// normalizeAESKey makes key length acceptable for AES (16/24/32 bytes).
+// If caller passes passphrase-ish key, derive 32-byte key via SHA-256.
+func normalizeAESKey(key []byte) []byte {
+	switch len(key) {
+	case 16, 24, 32:
+		return key
+	default:
+		sum := sha256.Sum256(key)
+		return sum[:]
+	}
 }
 
 // HashPassword returns Argon2id password hash string with per-user random salt.
