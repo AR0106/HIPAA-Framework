@@ -1,0 +1,221 @@
+#+TITLE: Technical Gap Checklist (Single machine; PHI in SQLite + Encrypted CSVs)
+#+STARTUP: overview
+#+TODO: TODO(t) IN-PROGRESS(p) BLOCKED(b) REVIEW(r) DONE(d)
+
+* 1) Data-at-rest (SQLite + encrypted CSVs)
+** [x] SQLite database encrypted at rest (sqleet)
+Evidence: `sql.Open("sqleet", "cdd.db?_key=...")` in `HIPAA Framework/user/user_service.go`
+
+*** DONE Remove hardcoded SQLite encryption key usage anywhere in code
+- Current gap: `GetDataEncryptionKey` opens DB with a hardcoded `_key=UWGB2029SecretKey` ignoring caller-provided secret.
+- Goal: all DB opens derive `_key` from a single secret source (env var / OS keychain / injected config), never a literal in code.
+
+** [-] Encrypted CSV storage for PHI (per-record AEAD)
+Evidence: AES-GCM used in `HIPAA Framework/crypto/crypto_service.go`; called from `HIPAA Framework/data/data_service.go`
+
+*** TODO Enforce strong, correctly-sized encryption keys for AES-GCM
+- Current gap: `EncryptData` accepts arbitrary byte slice; upstream may pass weak/short strings.
+- Goal: require 16/24/32-byte key (AES-128/192/256), reject others with explicit error.
+
+*** FUTURE Add versioned envelope format for encrypted CSV lines (algorithm + key id + nonce + ciphertext)
+- Current gap: ciphertext is base64(nonce||ciphertext) without metadata; rotation/migrations hard.
+- Goal: include a small header (version, key identifier) so you can rotate keys and still decrypt old lines.
+
+*** TODO Add cryptographic integrity for whole encrypted-CSV file (not just per-line)
+- Gap: AEAD protects each record, but attacker can delete/reorder/rollback lines.
+- Goal: add one:
+  - manifest hash chain per file (prev_hash || record_bytes)
+  - or periodic signed checkpoints
+  - or per-file Merkle root stored in DB + audited
+- Acceptance: verifier detects deletion/reorder/rollback of records.
+
+*** DONE Tighten filesystem permissions for all PHI-bearing artifacts
+- Current gap: data dir `0755`, data files `0644`, `audit.log` `0644` (readable by other users).
+- Goal: default to owner-only access on single machine.
+- Acceptance:
+  - directories: `0700`
+  - files: `0600`
+  - verified by creating new DB/log and checking mode bits.
+
+*** TODO Prevent PHI leakage via temp files, swap, crash dumps
+- Goal:
+  - avoid writing PHI to OS temp unless encrypted + `0600`
+  - scrub/limit panic dumps (no PHI in panic/error strings)
+  - document operational hardening: FileVault on, disable core dumps, restricted backups
+- Acceptance: tests/greps show no PHI in logs/errors; temp file usage audited.
+
+* 2) Key management (highest risk in current code)
+*** DONE Eliminate all hardcoded secrets/peppers from repository
+- Current gaps:
+  - password “pepper” literal in `HIPAA Framework/crypto/crypto_service.go`
+  - hardcoded DB key literal in `HIPAA Framework/crypto/crypto_service.go`
+- Goal: all secrets come from runtime secret source (env var, OS keychain, encrypted config).
+- Acceptance: `grep -R` for secret strings and obvious patterns (e.g., `SecretKey`, `_key=`) returns none.
+
+*** DONE Stop using a fixed shared data encryption key for every user/dataset
+- Current gap: `dataKey := []byte("abcdefgh12345678")` in `HIPAA Framework/user/user_service.go`.
+- Goal: generate unique data keys (per user, per dataset, or per file) with rotation capability.
+- Acceptance: registering two users yields distinct DEKs; compromise of one key does not decrypt others.
+
+*** TODO Add key rotation support for DEKs (and ability to decrypt old records)
+- Goal: rotate DEKs, mark new key active, keep old keys available for decrypt only.
+- Acceptance: after rotation, new writes use new DEK; old records remain readable.
+
+*** TODO Add master key strategy (KEK) + secure storage (macOS Keychain)
+- Goal:
+  - store KEK in OS keychain (or user-provided passphrase -> Argon2id -> KEK)
+  - store DEKs encrypted by KEK in keystore table
+  - never store raw DEKs at rest
+- Acceptance: DB contains only wrapped keys; app can re-open after restart via keychain/passphrase.
+
+*** TODO Add key lifecycle controls: generation, access logging, destruction (crypto erase)
+- Goal:
+  - key create/rotate/destroy all audited
+  - destroy = delete wrapped DEK + rotate KEK if needed
+- Acceptance: after destroy, decrypt fails; audit shows who/when/why.
+
+* 3) Authentication (person/entity authentication)
+** [-] Login/registration exists
+Evidence: `RegisterUser`, `LoginUser` in `HIPAA Framework/user/user_service.go`
+
+*** DONE Replace deterministic SHA-256 password hashing with Argon2id (or bcrypt) + per-user salt
+- Current gap: `HashPassword` is fast/deterministic; vulnerable to offline cracking.
+- Goal: use a standard password hash:
+  - Argon2id recommended (memory-hard)
+  - Store parameters + salt per user
+- Acceptance: password hash string encodes algorithm + params + salt; verification constant-time.
+
+*** TODO Add secure credential change flow
+- Goal: change password requires current password; rehash with new salt/params.
+- Acceptance: password change updates stored hash; old password no longer works; events audited.
+
+*** TODO Add brute-force defenses (rate limit + lockout) + audit
+- HIPAA: supports 164.312(d) person/entity auth; also 164.308(a)(5)(ii)(C) login monitoring.
+- Goal:
+  - per-username + per-IP attempt tracking (if networked)
+  - exponential backoff / temporary lockout
+  - audit login fail/success + lockout/unlock
+- Acceptance: repeated failures trigger lockout; logs show events.
+
+*** TODO Add MFA support (optional but strong) for any UI/app using this library
+- HIPAA: addressable; HITECH breach safe-harbor relies on strong encryption; MFA reduces account compromise.
+- Goal: TOTP/WebAuthn hooks; at minimum API surface to enforce MFA upstream.
+- Acceptance: integration sample shows MFA gate before PHI actions; events audited.
+
+* 4) Authorization (least privilege on ePHI access paths)
+* IGNORE: THIS IS TO BE DONE OUTSIDE OF LIBRARY
+** [-] User roles stored, not enforced
+Evidence: `role` column exists, but `data` service uses `id string` without user context.
+
+*** IGNORE Define explicit authorization rules for reading/writing PHI
+- Goal: document rules in code (constants/functions) and enforce at every entrypoint that touches PHI.
+- Acceptance: every PHI read/write call site requires a `User` (or subject) + decision function.
+
+*** IGNORE Enforce authorization checks in `data` service operations
+- Current gap: `InitDataService`, `SaveBalanceData`, `ReadBalanceData` do not consult user/role.
+- Goal: require authorized user context and verify permission before file open/read/write.
+- Acceptance: unauthorized role fails with clear error; tests cover allowed/denied cases.
+
+* 5) Audit logging (record access + integrity)
+** [x] Audit log exists but weak
+Evidence: `HIPAA Framework/audit/audit_service.go`
+
+*** DONE Move audit logging to structured format with escaping (no CSV injection)
+- Current gap: comma-separated strings with unescaped user-controlled fields.
+- Goal: use JSON lines or a CSV writer that quotes/escapes fields safely.
+- Acceptance: values with commas/newlines/quotes are safely encoded; parser can round-trip.
+
+*** TODO Generate timestamps inside logger (trusted timestamp source)
+**** Probably won't do this, but worth noting as a gap
+- Current gap: `Timestamp` passed in by caller.
+- Goal: logger sets timestamp (`time.Now().UTC()`), optionally includes monotonic sequence.
+- Acceptance: callers cannot spoof time; log entries consistent UTC format.
+
+*** DONE Add tamper-evident audit log integrity (hash chain or signatures)
+- Goal: detect deletion/modification:
+  - each record includes hash(prev_hash || record_bytes)
+  - store head hash securely (or periodic checkpoints)
+- Acceptance: verification tool can detect any modification/removal/reordering.
+
+*** DONE Expand audited events to cover PHI access + auth
+- Minimum events:
+  - login success/fail, lockout, password change
+  - PHI read/write/export/delete (what record/file, outcome)
+  - key access/rotation events
+- Acceptance: event schema includes actor, action, target, result, timestamp, reason/context.
+
+*** DONE Apply restrictive permissions + rotation for audit log file
+**** IF we come across an issue with size, then we'll add that rotation, otherwise just date for now
+- Goal: `0600` perms, rotate by size/date, prevent unbounded growth.
+- Acceptance: rotation works; old logs retained per technical retention setting.
+
+*** TODO Protect audit log confidentiality (encrypt audit log at rest)
+- Gap: audit may contain PHI identifiers; perms help but encryption stronger.
+- Goal: encrypt audit log (AEAD) with separate key; keep tamper-evidence.
+- Acceptance: audit file unreadable without key; verifier still works.
+
+* 6) Data integrity & correctness
+*** DONE Fix `DecryptData` short-ciphertext error handling to return a real error
+- Current gap: if ciphertext shorter than nonce, function returns `nil, err` where `err` may be nil.
+- Acceptance: test: short input returns non-nil error.
+
+*** DONE Fix ignored error in `GetDataEncryptionKey` (Scan error overwritten)
+- Current gap: `QueryRow(...).Scan` error is overwritten by later `:=` usage.
+- Acceptance: missing keystore row surfaces as explicit error; tests cover.
+
+* 7) Backup/restore (technical only)
+*** TODO Implement encrypted backup for SQLite + encrypted CSV directory
+- Goal: produce backup artifact with confidentiality + integrity.
+- Acceptance: backup script outputs single archive; restore recreates working app state.
+
+*** TODO Implement restore verification routine
+- Goal: after restore, run automated check:
+  - DB opens with key
+  - sample encrypted CSV lines decrypt
+  - audit log verification (hash chain) passes
+- Acceptance: one command verifies restore correctness.
+
+* 9) Access control (HIPAA 164.312(a)) / session management
+*** TODO Emergency access ("break-glass") mechanism (addressable 164.312(a)(2)(ii))
+- Goal:
+  - separate break-glass credential stored offline or controlled
+  - always audited + alert flag in logs
+- Acceptance: break-glass use leaves unmistakable audit trail; can be disabled by policy.
+
+*** TODO Unique user identification verification + account deprovision
+- Goal:
+  - ensure no shared accounts in sample app
+  - add disable/delete user flow; revoke keys/sessions; audit
+- Acceptance: disabled user cannot access; keys rotated/locked as configured.
+
+* 10) Data lifecycle: export, retention, deletion (media controls support)
+*** TODO Implement retention policy + purge for PHI records/files
+- Goal:
+  - configurable retention window
+  - purge job removes PHI + associated keys/manifests
+  - audit purge events
+- Acceptance: after retention window, records unrecoverable (crypto erase or secure delete).
+
+* 11) Vulnerability management / secure build (HITECH-friendly)
+*** TODO Add dependency vuln scanning for Go (govulncheck) + CI gate
+- Goal: fail CI on known vuln affecting reachable code paths.
+- Acceptance: CI job exists; produces report artifacts.
+
+*** TODO Add secrets scanning (gitleaks/trufflehog) + pre-commit + CI
+- Goal: prevent new secrets in repo; scan history if needed.
+- Acceptance: CI fails on secret patterns; developer hook installed.
+
+*** TODO Add reproducible builds + signed releases (if distributed)
+- Goal: integrity of delivered binaries.
+- Acceptance: release artifacts signed; checksum published.
+
+* 12) Breach detection support (HITECH operational trigger, technical signals)
+*** TODO Add security-event hooks for alerting/monitoring
+- Goal:
+  - emit events on: repeated login fails, key access, export, break-glass, audit verify fail
+  - integrate with OS logs or upstream SIEM
+- Acceptance: demo shows alerts on suspicious patterns; events include correlation id.
+
+*** TODO Add audit verification on startup + periodic verify
+- Goal: detect tampering early; block PHI ops if audit integrity fails (configurable).
+- Acceptance: tamper test causes verify fail; app refuses PHI ops or enters safe mode.
